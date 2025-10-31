@@ -37,6 +37,7 @@ services:
       dockerfile: Dockerfile
     container_name: alert_watcher
     environment:
+      LOG_PATH: /var/log/nginx/access.log
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
       ACTIVE_POOL: ${ACTIVE_POOL}
       ERROR_RATE_THRESHOLD: ${ERROR_RATE_THRESHOLD}
@@ -44,11 +45,9 @@ services:
       ALERT_COOLDOWN_SEC: ${ALERT_COOLDOWN_SEC}
       POLL_INTERVAL: ${POLL_INTERVAL}
       MAINTENANCE_MODE: ${MAINTENANCE_MODE}
-      MAINTENANCE_FILE: /app/maintenance/maintenance.flag
       QUIET: ${QUIET}
     volumes:
-      - nginx_logs:/var/log/nginx:ro
-      - ./watcher/maintenance:/app/maintenance:ro
+      - ./nginx/logs:/var/log/nginx
     depends_on:
       - nginx
 

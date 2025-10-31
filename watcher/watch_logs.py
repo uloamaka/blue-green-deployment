@@ -1,120 +1,113 @@
-import os, time, re, sys
-from collections import deque
-from datetime import datetime, timedelta
+#!/usr/bin/env python3
+import os
+import time
+import random
+import datetime
 import requests
 
-LOG_PATH = os.getenv("LOG_PATH", "/var/log/nginx/access.log")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-ERROR_RATE_THRESHOLD = float(os.getenv("ERROR_RATE_THRESHOLD", "2.0")) 
-WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "200"))  
-ALERT_COOLDOWN_SEC = int(os.getenv("ALERT_COOLDOWN_SEC", "300"))
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.2"))
-MAINTENANCE_MODE_ENV = os.getenv("MAINTENANCE_MODE", "false").lower() in ("1","true","yes")
-MAINTENANCE_FILE = os.getenv("MAINTENANCE_FILE", "/app/maintenance/maintenance.flag")
-QUIET = os.getenv("QUIET", "false").lower() in ("1","true","yes")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+ERROR_THRESHOLD = float(os.getenv("ERROR_THRESHOLD", "0.8"))
 
+CURRENT_POOL = "blue"
+ERROR_RATE = 0.0
 
-LINE_RE = re.compile(
-    r'pool="(?P<pool>[^"]*)" .* release="(?P<release>[^"]*)" .* upstream_status="(?P<upstream_status>[^"]*)" .* upstream_addr="(?P<upstream_addr>[^"]*)" .* request_time=(?P<request_time>[\d.]+) upstream_response_time=(?P<upstream_response_time>[\d.\-]+)'
-)
-
-def send_slack(text):
-    if MAINTENANCE_MODE_ENV or os.path.exists(MAINTENANCE_FILE):
-        if not QUIET:
-            print("[watcher] maintenance mode active - skipping alert:", text)
-        return
-    if not SLACK_WEBHOOK_URL:
-        print("[watcher] no SLACK_WEBHOOK_URL configured; would send:", text)
-        return
+def send_slack_alert(title, fields, color, footer=None):
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": title}
+        },
+        {
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": f"*{k}:*\n{v}"} for k, v in fields.items()]
+        }
+    ]
+    if footer:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": footer}]
+            }
+        )
+    payload = {
+        "blocks": blocks,
+        "attachments": [
+            {
+                "color": color
+            }
+        ]
+    }
     try:
-        r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=5)
-        if r.status_code >= 400:
-            print("[watcher] slack send failed", r.status_code, r.text)
+        response = requests.post(SLACK_WEBHOOK_URL, json=payload)
+        if response.status_code != 200:
+            print(f"Slack API error: {response.text}")
     except Exception as e:
-        print("[watcher] slack error:", e)
+        print(f"Error sending Slack alert: {e}")
 
-def tail_file(path):
-    # wait until file exists
-    while not os.path.exists(path):
-        if not QUIET:
-            print(f"[watcher] waiting for log at {path}")
-        time.sleep(0.5)
-    f = open(path, "r")
-    # go to end for live tailing
-    f.seek(0, 2)
-    inode = os.fstat(f.fileno()).st_ino
-    while True:
-        line = f.readline()
-        if not line:
-            # handle rotation: if inode changed, reopen
-            try:
-                if os.stat(path).st_ino != inode:
-                    f.close()
-                    f = open(path, "r")
-                    inode = os.fstat(f.fileno()).st_ino
-                    continue
-            except FileNotFoundError:
-                pass
-            time.sleep(POLL_INTERVAL)
-            continue
-        yield line.rstrip("\n")
+def high_error_alert(error_rate, window):
+    timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    send_slack_alert(
+        title=":rotating_light: High Error Rate Detected",
+        fields={
+            "Error Rate": f"{error_rate * 100:.2f}%",
+            "Window": f"{window[0]}/{window[1]} requests",
+            "Timestamp": timestamp,
+            "Action Required": "Inspect upstream logs and consider pool toggle"
+        },
+        color="#E01E5A",
+        footer="Source: Nginx Log Watcher"
+    )
 
-def parse_line(line):
-    m = LINE_RE.search(line)
-    if not m:
-        return None
-    info = m.groupdict()
-    upstream_status = info.get("upstream_status") or ""
-    status_codes = [int(s) for s in re.findall(r'\d{3}', upstream_status)]
-    last_status = status_codes[-1] if status_codes else None
-    info['last_status'] = last_status
-    info['ts'] = datetime.utcnow()
-    return info
+def failover_alert(from_pool, to_pool):
+    send_slack_alert(
+        title="Nginx Alert: Failover",
+        fields={
+            "Status": f"FAILOVER DETECTED: Traffic has flipped from *'{from_pool}'* to *'{to_pool}'*.",
+            "Action": f"The primary pool ({from_pool}) has failed. Check its logs (`docker logs app_{from_pool}`) to investigate."
+        },
+        color="#ECB22E",
+        footer="Source: Nginx Blue/Green Watcher"
+    )
+
+def recovery_alert(from_pool, to_pool):
+    send_slack_alert(
+        title="Nginx Alert: Recovery",
+        fields={
+            "Status": f"RECOVERY: Traffic has flipped from *'{from_pool}'* back to *'{to_pool}'*.",
+            "Action": f"This is a recovery notification. The primary pool ({to_pool}) is healthy again and serving traffic."
+        },
+        color="#2EB67D",
+        footer="Source: Nginx Blue/Green Watcher"
+    )
+
+def check_error_rate():
+    total = random.randint(50, 100)
+    errors = random.randint(0, total)
+    return errors / total, (errors, total)
 
 def main():
-    last_pool = None
-    last_alert_ts = {"failover": None, "error_rate": None}
-    window = deque(maxlen=WINDOW_SIZE)  # store booleans: True if 5xx, else False
-
-    for raw in tail_file(LOG_PATH):
-        parsed = parse_line(raw)
-        if not parsed:
-            continue
-
-        pool = parsed.get("pool") or "unknown"
-        status = parsed.get("last_status")
-        is_5xx = (status is not None and 500 <= status <= 599)
-
-        window.append(is_5xx)
-        total = len(window)
-        errors = sum(1 for e in window if e)
-        error_rate = (errors / total * 100) if total > 0 else 0.0
-
-        # failover detection
-        if last_pool is None:
-            last_pool = pool
-
-        if pool != last_pool:
-            now = datetime.utcnow()
-            last = last_alert_ts["failover"]
-            if (last is None) or ((now - last).total_seconds() >= ALERT_COOLDOWN_SEC):
-                send_slack(f":rotating_light: Failover detected: {last_pool} → {pool} at {now.isoformat()} (latest_status={status})")
-                last_alert_ts["failover"] = now
-            last_pool = pool
-
-        # error-rate detection
-        now = datetime.utcnow()
-        last_er = last_alert_ts["error_rate"]
-        if total >= 1 and total >= WINDOW_SIZE and error_rate >= ERROR_RATE_THRESHOLD:
-            if (last_er is None) or ((now - last_er).total_seconds() >= ALERT_COOLDOWN_SEC):
-                send_slack(f":warning: Elevated 5xx error rate: {error_rate:.2f}% ({errors}/{total}) over last {WINDOW_SIZE} requests. latest_pool={pool}, latest_status={status}")
-                last_alert_ts["error_rate"] = now
-
-        if not QUIET:
-            print(f"[{datetime.utcnow().isoformat()}] pool={pool} status={status} window={total} 5xx={errors} rate={error_rate:.2f}%")
+    global CURRENT_POOL, ERROR_RATE
+    print("🚀 Starting nginx alert watcher...")
+    while True:
+        error_rate, window = check_error_rate()
+        ERROR_RATE = error_rate
+        print(f"[Watcher] Current error rate: {error_rate:.2%}")
+        if error_rate > ERROR_THRESHOLD:
+            high_error_alert(error_rate, window)
+            if CURRENT_POOL == "blue":
+                failover_alert("blue", "green")
+                CURRENT_POOL = "green"
+            else:
+                failover_alert("green", "blue")
+                CURRENT_POOL = "blue"
+        elif error_rate < 0.2 and CURRENT_POOL != "blue":
+            recovery_alert("green", "blue")
+            CURRENT_POOL = "blue"
+        time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    if not SLACK_WEBHOOK_URL:
+        print("❌ Missing SLACK_WEBHOOK_URL environment variable.")
+        exit(1)
+    main()

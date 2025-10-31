@@ -1,6 +1,6 @@
 upstream app_backend {
-    server app_blue:8080;
-    server app_green:8080;
+    server app_blue:8080 max_fails=2 fail_timeout=3s;
+    server app_green:8080 backup;
 }
 
 log_format custom_json escape=json
@@ -46,4 +46,3 @@ server {
         add_header Content-Type text/plain;
     }
 }
-
